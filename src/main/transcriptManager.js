@@ -6,6 +6,10 @@ class TranscriptManager {
         this.awsQueue = [];
         this.accumulatedTranscript = "";
 
+        this.lastOcrText = "";
+        this.lastOcrEmitTime = 0;
+        this.lastOcrEmitText = "";
+
         // Every 20 seconds, process the transcript and POST to AWS Lambda
         this.postInterval = setInterval(() => {
             this.postAccumulatedTranscript();
@@ -18,9 +22,41 @@ class TranscriptManager {
         this.mergeQueues();
     }
 
+    getIncrementalText(previous, current) {
+        if (!previous) return current;
+        if (current.startsWith(previous)) {
+            return current.slice(previous.length).trim();
+        }
+        if (current.includes(previous)) {
+            return current.replace(previous, "").trim();
+        }
+        return current;
+    }
+
+    isLikelyGarbage(text) {
+        if (text.length < 5) return true;
+        if (/\d{1,2}:\d{2}/.test(text)) return true;
+        if (/[^\w\s]{3,}/.test(text)) return true;
+        const nonLetterCount = text.replace(/[\w\s]/g, '').length;
+        if (nonLetterCount / text.length > 0.3) return true;
+        return false;
+    }
+
     addScraperText(text) {
+        const cleanedText = text.trim().replace(/\s+/g, ' ');
+        if (cleanedText.length < 5) return;
+
+        let incrementalText = cleanedText;
+
+        if (this.lastOcrText && cleanedText.startsWith(this.lastOcrText)) {
+            incrementalText = cleanedText.slice(this.lastOcrText.length).trim();
+            if (!incrementalText) return;
+        }
+
+        this.lastOcrText = cleanedText;
+
         const timestamp = Date.now();
-        this.scraperQueue.push({ text, timestamp });
+        this.scraperQueue.push({ text: incrementalText, timestamp });
         this.mergeQueues();
     }
 
@@ -35,7 +71,7 @@ class TranscriptManager {
             const duplicateIndex = this.scraperQueue.findIndex(sc => {
                 const timeDiff = Math.abs(sc.timestamp - awsItem.timestamp);
                 if (timeDiff <= 2000) {
-                    return this.calculateSimilarity(sc.text, awsItem.text) > 0.7;
+                    return this.calculateSimilarity(sc.text, awsItem.text) > 85;
                 }
                 return false;
             });
@@ -64,14 +100,25 @@ class TranscriptManager {
         }
     }
 
-    calculateSimilarity(str1, str2) {
-        if (!str1 || !str2) return 0;
-        // Simple token matching similarity
-        const set1 = new Set(str1.toLowerCase().split(/\s+/));
-        const set2 = new Set(str2.toLowerCase().split(/\s+/));
-        const intersection = new Set([...set1].filter(x => set2.has(x)));
-        const union = new Set([...set1, ...set2]);
-        return intersection.size / union.size;
+    calculateSimilarity(a, b) {
+        if (!a || !b) return 0;
+        const getWords = str => {
+            const cleaned = String(str).toLowerCase().replace(/[^\w\s]|_/g, '');
+            return new Set(cleaned.split(/\s+/).filter(Boolean));
+        };
+
+        const setA = getWords(a);
+        const setB = getWords(b);
+
+        if (setA.size === 0 && setB.size === 0) return 100;
+
+        let intersection = 0;
+        for (const word of setA) {
+            if (setB.has(word)) intersection++;
+        }
+
+        const union = setA.size + setB.size - intersection;
+        return union === 0 ? 100 : (intersection / union) * 100;
     }
 
     async postAccumulatedTranscript() {
@@ -80,9 +127,6 @@ class TranscriptManager {
         const payload = {
             transcript: this.accumulatedTranscript.trim()
         };
-
-        // Clear buffer after extracting payload
-        this.accumulatedTranscript = "";
 
         try {
             // Placeholder Lambda endpoint

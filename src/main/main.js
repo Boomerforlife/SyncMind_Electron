@@ -3,16 +3,25 @@ const { app, BrowserWindow, BrowserView, ipcMain, desktopCapturer } = require('e
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
+const { spawn } = require('child_process');
 const TranscriptManager = require('./transcriptManager');
 const AwsTranscribeService = require('./awsTranscribe');
+
+const USE_LOCAL_WHISPER = true;
 
 let mainWindow;
 let scraperView;
 let transcriptManager;
 let awsTranscribeService;
 
+let localWhisperBuffer = [];
+let localWhisperInterval = null;
+let whisperProcess = null;
+
 // Meeting Logger Path
 const logFilePath = path.join(process.cwd(), 'meeting_log.txt');
+
+ipcMain.handle('get-whisper-mode', () => USE_LOCAL_WHISPER);
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -83,6 +92,14 @@ function createWindow() {
 app.whenReady().then(() => {
     createWindow();
 
+    // CRASH DIAGNOSTIC: Log renderer crash reason to main process terminal
+    app.on('render-process-gone', (event, webContents, details) => {
+        console.error('[MAIN CRASH DIAGNOSTIC] render-process-gone:', {
+            reason: details.reason,
+            exitCode: details.exitCode
+        });
+    });
+
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
             createWindow();
@@ -99,22 +116,107 @@ app.on('window-all-closed', () => {
 
 // Audio Stream IPC
 ipcMain.on('start-audio', (event) => {
-    awsTranscribeService.startStream((status) => {
-        mainWindow.webContents.send('audio-status', status);
-    });
+    if (USE_LOCAL_WHISPER) {
+        localWhisperBuffer = [];
+        if (localWhisperInterval) clearInterval(localWhisperInterval);
+
+        // STEP 7 GUARD: Spawn Python ONCE cleanly, handle errors
+        if (!whisperProcess || whisperProcess.killed) {
+            try {
+                const pythonExe = path.join(process.cwd(), 'venv', 'Scripts', 'python.exe');
+                console.log("[WHISPER GUARD] Spawning python process...");
+                whisperProcess = spawn(pythonExe, ['whisper_worker.py']);
+
+                whisperProcess.stdout.on('data', (data) => {
+                    const strings = data.toString().split('\n');
+                    for (const str of strings) {
+                        if (!str.trim()) continue;
+                        try {
+                            const result = JSON.parse(str);
+                            if (result.text && result.text.trim()) {
+                                transcriptManager.addAwsText(result.text.trim());
+                            }
+                        } catch (err) {
+                            console.error("[WHISPER GUARD] parsing error:", err, "Raw:", str);
+                        }
+                    }
+                });
+
+                whisperProcess.stderr.on('data', (data) => {
+                    console.error("[WHISPER GUARD ERR]:", data.toString());
+                });
+
+                whisperProcess.on('error', (err) => {
+                    console.error("[WHISPER GUARD FATAL] Failed to spawn:", err);
+                });
+
+                whisperProcess.on('close', (code) => {
+                    console.warn(`[WHISPER GUARD] Process exited with code ${code}`);
+                });
+            } catch (err) {
+                console.error("[WHISPER GUARD FATAL] Exception spawning python:", err);
+            }
+        } else {
+            console.log("[WHISPER GUARD] Reusing existing python process.");
+        }
+
+        localWhisperInterval = setInterval(() => {
+            if (localWhisperBuffer.length === 0) return;
+
+            // STEP 6 GUARD: Grab accumulator rapidly, clear immediately so main thread doesn't lag
+            const chunks = [...localWhisperBuffer];
+            localWhisperBuffer = [];
+
+            const combinedBuffer = Buffer.concat(chunks);
+            console.log(`[MAIN GUARD] Piping buffer to Whisper. Array count: ${chunks.length}, Byte size: ${combinedBuffer.length}`);
+
+            if (whisperProcess && !whisperProcess.killed && whisperProcess.stdin) {
+                try {
+                    whisperProcess.stdin.write(combinedBuffer.toString('base64') + '\n');
+                } catch (err) {
+                    console.error("[WHISPER GUARD] Failed writing to stdin:", err);
+                }
+            }
+        }, 3000);
+
+        mainWindow.webContents.send('audio-status', 'started');
+    } else {
+        awsTranscribeService.startStream((status) => {
+            mainWindow.webContents.send('audio-status', status);
+        });
+    }
 });
 
 ipcMain.on('audio-chunk', (event, chunk) => {
-    // chunk is passed from renderer as ArrayBuffer -> Buffer
-    if (awsTranscribeService.isActive) {
-        awsTranscribeService.pushAudioChunk(chunk);
+    // chunk is passed from renderer as ArrayBuffer -> Buffer wrapped safely
+    if (USE_LOCAL_WHISPER) {
+        if (!chunk) return;
+        localWhisperBuffer.push(Buffer.from(chunk));
+        // STEP 6 GUARD: Safe logging to prevent lag
+        if (localWhisperBuffer.length % 50 === 0) {
+            console.log(`[MAIN GUARD] Accumulated ${localWhisperBuffer.length} Whisper audio chunks...`);
+        }
+    } else {
+        if (awsTranscribeService.isActive) {
+            awsTranscribeService.pushAudioChunk(chunk);
+        }
     }
 });
 
 ipcMain.on('stop-audio', (event) => {
-    awsTranscribeService.stopStream((status) => {
-        mainWindow.webContents.send('audio-status', status);
-    });
+    if (USE_LOCAL_WHISPER) {
+        if (localWhisperInterval) clearInterval(localWhisperInterval);
+        localWhisperBuffer = [];
+        if (whisperProcess && !whisperProcess.killed) {
+            whisperProcess.kill();
+        }
+        whisperProcess = null;
+        mainWindow.webContents.send('audio-status', 'stopped');
+    } else {
+        awsTranscribeService.stopStream((status) => {
+            mainWindow.webContents.send('audio-status', status);
+        });
+    }
 });
 
 // Scraper IPC from hidden view
@@ -131,11 +233,12 @@ ipcMain.on('scraper-caption-detected', (event, text) => {
     }
 });
 
-ipcMain.on('ocr-caption-detected', (event, text) => {
-    if (transcriptManager) {
-        transcriptManager.addScraperText(text);
-    }
-});
+// ipcMain.on('ocr-caption-detected', (event, text) => {
+//     console.log("MAIN PROCESS RECEIVED OCR:", text);
+//     if (transcriptManager) {
+//         transcriptManager.addScraperText(text);
+//     }
+// });
 
 let isFloating = false;
 

@@ -1,10 +1,20 @@
 import React, { useState, useEffect, useRef } from 'react';
-import Tesseract from 'tesseract.js';
+// import Tesseract from 'tesseract.js';
 
 // With nodeIntegration: true and contextIsolation: false, we can require electron directly in the renderer
 const electron = window.require ? window.require('electron') : null;
 const ipcRenderer = electron ? electron.ipcRenderer : null;
 const desktopCapturer = electron ? electron.desktopCapturer : null;
+
+// Crash Diagnostic Addition
+window.onerror = function (message, source, lineno, colno, error) {
+    console.error("FATAL CRASH [window.onerror]:", { message, source, lineno, colno, error });
+    return false;
+};
+
+window.addEventListener('unhandledrejection', function (event) {
+    console.error("FATAL CRASH [unhandledrejection]:", event.reason);
+});
 
 function App() {
     const [sources, setSources] = useState([]);
@@ -12,11 +22,11 @@ function App() {
     const [isMonitoring, setIsMonitoring] = useState(false);
     const [liveTranscript, setLiveTranscript] = useState('');
     const [isFloating, setIsFloating] = useState(false);
+    const [whisperMode, setWhisperMode] = useState(false);
 
     const videoRef = useRef(null);
-    const canvasRef = useRef(null);
     const streamRef = useRef(null);
-    const ocrIntervalRef = useRef(null);
+    const transcriptEndRef = useRef(null);
 
     // Audio Refs
     const audioContextRef = useRef(null);
@@ -27,6 +37,7 @@ function App() {
         fetchSources();
 
         if (ipcRenderer) {
+            ipcRenderer.invoke('get-whisper-mode').then(mode => setWhisperMode(mode));
             ipcRenderer.on('transcript-updated', (event, text) => {
                 setLiveTranscript(text);
             });
@@ -39,6 +50,12 @@ function App() {
             }
         };
     }, []);
+
+    useEffect(() => {
+        if (transcriptEndRef.current) {
+            transcriptEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        }
+    }, [liveTranscript]);
 
     const fetchSources = async () => {
         if (ipcRenderer) {
@@ -61,58 +78,149 @@ function App() {
         }
     };
 
-    const startMonitoring = async () => {
-        if (!selectedSource) return;
+    // CRASH ISOLATION: Set to 1, then increment after each passing test
+    // 1 = button only, 2 = mic capture, 3 = desktop capture, 4 = AudioContext, 5 = ScriptProcessor (log only), 6 = full IPC pipeline
+    const CRASH_ISOLATION_STEP = 6;
 
+    const startMonitoring = async () => {
+        console.log(`[ISO STEP ${CRASH_ISOLATION_STEP}] Start Capture clicked`);
+
+        // STEP 1 — Button+State only. If app crashes here the issue is in React state.
+        setIsMonitoring(true);
+        setLiveTranscript("");
+        if (CRASH_ISOLATION_STEP === 1) {
+            console.log("[ISO STEP 1] PASS: state updated, no crash.");
+            return;
+        }
+
+        // STEP 2 — Mic-only capture (no desktop). If mic crashes, it's a media API issue.
+        if (CRASH_ISOLATION_STEP === 2) {
+            try {
+                const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                console.log("[ISO STEP 2] PASS: Mic stream acquired.", micStream.getAudioTracks());
+                micStream.getTracks().forEach(t => t.stop());
+            } catch (err) {
+                console.error("[ISO STEP 2] FAIL: Mic capture failed:", err);
+            }
+            return;
+        }
+
+        // STEP 3 — Desktop audio capture.
+        // CRITICAL: On Windows/Electron, audio-only desktop capture crashes Chromium.
+        // Must request video:true along with audio to open the desktop capture pipeline,
+        // then stop the video track immediately.
+        if (!selectedSource) {
+            console.error("[ISO STEP 3+] No source selected.");
+            setIsMonitoring(false);
+            return;
+        }
+        console.log(`[ISO STEP 3+] selectedSource: ${selectedSource}`);
+
+        let stream;
         try {
-            // In older Electron versions, screen capture constraints differ slightly, 
-            // but this is standard for modern Electron WebRTC
-            // Note: On Windows, capturing audio alongside video via getDisplayMedia or desktopCapturer
-            // often fails with "IDXGIDuplicateOutput does not use RGBA" or "-2147024809" if the source 
-            // isn't capturable or if the system doesn't support loopback on that specific window.
-            // For this MVP, we will try to capture just the video if audio fails, or try audio:false first 
-            // based on the user's specific error log.
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: false, // Disabling audio capture temporarily to ensure video/OCR does not crash the app
+            stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    mandatory: {
+                        chromeMediaSource: 'desktop',
+                        chromeMediaSourceId: selectedSource
+                    }
+                },
                 video: {
                     mandatory: {
                         chromeMediaSource: 'desktop',
-                        chromeMediaSourceId: selectedSource,
-                        minWidth: 1280,
-                        maxWidth: 1920,
-                        minHeight: 720,
-                        maxHeight: 1080
+                        chromeMediaSourceId: selectedSource
                     }
                 }
             });
-
-            streamRef.current = stream;
-            if (videoRef.current) {
-                videoRef.current.srcObject = stream;
-                videoRef.current.play();
-            }
-
-            setIsMonitoring(true);
-
-            // Start The Ear (Audio Context -> AWS)
-            startAudioPipeline(stream);
-
-            // Start The Eyes (Canvas -> Tesseract)
-            startOcrPipeline();
-
-            if (ipcRenderer) {
-                ipcRenderer.send('start-audio');
-            }
-
+            // Stop video tracks immediately — we only want audio
+            stream.getVideoTracks().forEach(t => t.stop());
+            const audioTracks = stream.getAudioTracks();
+            const audioOnlyStream = new MediaStream(audioTracks);
+            console.log("[ISO STEP 3+] PASS: Desktop audio stream acquired.", audioTracks);
+            stream = audioOnlyStream;
         } catch (err) {
-            console.error("Failed to capture stream", err);
-            alert("Could not capture the selected window. Please check permissions.");
+            console.error("[ISO STEP 3+] FAIL: Desktop capture failed:", err);
+            setIsMonitoring(false);
+            return;
+        }
+
+        if (CRASH_ISOLATION_STEP === 3) {
+            stream.getTracks().forEach(t => t.stop());
+            console.log("[ISO STEP 3] PASS: stream stopped cleanly.");
+            return;
+        }
+
+        streamRef.current = stream;
+
+        // STEP 4 — AudioContext only. If this crashes, it's a hardware/driver fault.
+        let audioContext;
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            console.log(`[ISO STEP 4+] PASS: AudioContext sampleRate: ${audioContext.sampleRate}`);
+            audioContextRef.current = audioContext;
+        } catch (err) {
+            console.error("[ISO STEP 4+] FAIL: AudioContext creation failed:", err);
+            stream.getTracks().forEach(t => t.stop());
+            setIsMonitoring(false);
+            return;
+        }
+
+        if (CRASH_ISOLATION_STEP === 4) {
+            audioContext.close();
+            stream.getTracks().forEach(t => t.stop());
+            console.log("[ISO STEP 4] PASS: AudioContext closed cleanly.");
+            return;
+        }
+
+        // STEP 5 — ScriptProcessor with log only (NO IPC). If this crashes, onaudioprocess is the issue.
+        const source = audioContext.createMediaStreamSource(stream);
+        sourceNodeRef.current = source;
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        processor.onaudioprocess = (e) => {
+            const inputData = e.inputBuffer.getChannelData(0);
+            if (CRASH_ISOLATION_STEP === 5) {
+                // ONLY log — no conversion, no IPC
+                console.log(`[ISO STEP 5] Frame size: ${inputData.length}, sampleRate: ${audioContext.sampleRate}`);
+                return;
+            }
+
+            // STEP 6 — Full safe conversion + IPC send
+            const ratio = audioContext.sampleRate / 16000;
+            const newLength = Math.round(inputData.length / ratio);
+            const downsampled = new Float32Array(newLength);
+            let offset = 0;
+            for (let i = 0; i < newLength; i++) {
+                downsampled[i] = inputData[Math.floor(offset)] || 0;
+                offset += ratio;
+            }
+            const pcm16 = new Int16Array(downsampled.length);
+            for (let i = 0; i < downsampled.length; i++) {
+                const s = Math.max(-1, Math.min(1, downsampled[i]));
+                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            if (ipcRenderer) {
+                // Use Buffer.from() — Electron 28 IPC cannot deserialize Uint8Array/typed arrays (reason 263 crash)
+                const buffer = Buffer.from(pcm16.buffer);
+                ipcRenderer.send('audio-chunk', buffer);
+            }
+        };
+
+        // Must connect to destination (even silent) or onaudioprocess never fires
+        const gainNode = audioContext.createGain();
+        gainNode.gain.value = 0;
+        source.connect(processor);
+        processor.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+
+        if (ipcRenderer) {
+            ipcRenderer.send('start-audio');
         }
     };
 
     const stopMonitoring = () => {
         setIsMonitoring(false);
-        if (ocrIntervalRef.current) clearInterval(ocrIntervalRef.current);
 
         // Stop AV Streams
         if (streamRef.current) {
@@ -132,75 +240,9 @@ function App() {
         }
     };
 
-    const startAudioPipeline = (stream) => {
-        const audioTracks = stream.getAudioTracks();
-        if (audioTracks.length === 0) {
-            console.warn("No audio track found in stream. Please endure 'Share Audio' is enabled system-side.");
-            return;
-        }
-
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-        audioContextRef.current = audioContext;
-
-        const source = audioContext.createMediaStreamSource(stream);
-        sourceNodeRef.current = source;
-
-        const processor = audioContext.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
-
-        processor.onaudioprocess = (e) => {
-            const inputData = e.inputBuffer.getChannelData(0);
-            const pcm16 = new Int16Array(inputData.length);
-            for (let i = 0; i < inputData.length; i++) {
-                let s = Math.max(-1, Math.min(1, inputData[i]));
-                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            }
-            if (ipcRenderer && isMonitoring) {
-                ipcRenderer.send('audio-chunk', pcm16.buffer);
-            }
-        };
-
-        source.connect(processor);
-        processor.connect(audioContext.destination);
-    };
-
-    const startOcrPipeline = () => {
-        ocrIntervalRef.current = setInterval(processVideoFrame, 2000);
-    };
-
-    const processVideoFrame = async () => {
-        const video = videoRef.current;
-        const canvas = canvasRef.current;
-        if (!video || !canvas || video.videoWidth === 0) return;
-
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-        // Bottom 20% coordinates
-        const sx = 0;
-        const sy = video.videoHeight * 0.8;
-        const sw = video.videoWidth;
-        const sh = video.videoHeight * 0.2;
-
-        canvas.width = sw;
-        canvas.height = sh;
-
-        ctx.filter = 'grayscale(100%) contrast(200%)';
-        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
-
-        const dataURL = canvas.toDataURL('image/png');
-
-        try {
-            const result = await Tesseract.recognize(dataURL, 'eng', { logger: () => { } });
-            let currentText = result.data.text.replace(/\n/g, ' ').trim();
-
-            // Basic noise reduction
-            if (currentText.length > 5 && ipcRenderer) {
-                ipcRenderer.send('ocr-caption-detected', currentText);
-            }
-        } catch (err) {
-            console.error('OCR Error:', err);
-        }
-    };
+    // OCR disabled
+    // const startOcrPipeline = () => {};
+    // const processVideoFrame = async () => {};
 
     return (
         <div className={`p-4 h-screen flex flex-col gap-4 ${isFloating ? 'bg-black/90 backdrop-blur border border-white/20' : 'bg-background'}`}>
@@ -232,17 +274,25 @@ function App() {
                 {/* Video Preview */}
                 <div className="flex-1 bg-black border border-white/10 rounded overflow-hidden relative group">
                     <video ref={videoRef} autoPlay muted className="w-full h-full object-contain pointer-events-none" />
-                    <div className="absolute bottom-0 w-full h-[20%] border-t-2 border-dashed border-primary bg-primary/10 flex items-center justify-center opacity-50 group-hover:opacity-100 transition-opacity pointer-events-none">
-                        <span className="bg-black/80 text-white text-[10px] px-2 py-1 rounded">OCR Zone</span>
-                    </div>
                 </div>
-                <canvas ref={canvasRef} className="hidden" />
 
                 {/* Transcript Panel */}
-                <div className="flex-1 bg-surface border border-white/10 rounded flex flex-col p-3 overflow-hidden">
-                    <h2 className="text-xs font-semibold uppercase tracking-wider text-muted mb-2">Live Merged Transcript</h2>
-                    <div className="flex-1 overflow-y-auto text-sm text-text/90 italic p-2 bg-black/20 rounded break-words whitespace-pre-wrap">
-                        {liveTranscript || "Awaiting audio and captions..."}
+                <div className="flex-1 bg-surface border border-white/10 rounded flex flex-col p-4 overflow-hidden shadow-lg">
+                    <div className="flex justify-between items-center mb-3">
+                        <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">Meeting Transcript</h2>
+                        <span className={`text-[10px] px-2 py-1 rounded text-white font-medium ${whisperMode ? 'bg-green-600' : 'bg-blue-600'}`}>
+                            {whisperMode ? 'Local Whisper Mode' : 'AWS Transcribe Mode'}
+                        </span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto text-base text-text/90 p-4 bg-black/30 rounded flex flex-col gap-2 relative">
+                        {liveTranscript ? (
+                            <div className="whitespace-pre-wrap leading-relaxed">{liveTranscript}</div>
+                        ) : (
+                            <div className="absolute inset-0 flex items-center justify-center text-muted italic">
+                                {isMonitoring ? "Listening..." : "Click Start Capture to begin"}
+                            </div>
+                        )}
+                        <div ref={transcriptEndRef} />
                     </div>
                 </div>
             </div>
