@@ -163,21 +163,74 @@ ipcMain.on('start-audio', (event) => {
         localWhisperInterval = setInterval(() => {
             if (localWhisperBuffer.length === 0) return;
 
-            // STEP 6 GUARD: Grab accumulator rapidly, clear immediately so main thread doesn't lag
             const chunks = [...localWhisperBuffer];
             localWhisperBuffer = [];
 
-            const combinedBuffer = Buffer.concat(chunks);
-            console.log(`[MAIN GUARD] Piping buffer to Whisper. Array count: ${chunks.length}, Byte size: ${combinedBuffer.length}`);
+            // A) Combine Float32 frames
+            const inputSampleRate = chunks[0].sampleRate || 48000;
+            const totalBytes = chunks.reduce((acc, curr) => acc + curr.data.length, 0);
+            const combinedBuffer = Buffer.concat(chunks.map(c => Buffer.from(c.data)), totalBytes);
+            // Reconstruct Float32Array from combined bytes
+            const combinedFloat32 = new Float32Array(combinedBuffer.buffer, combinedBuffer.byteOffset, combinedBuffer.length / 4);
+
+            // B) Compute RMS
+            let sumSquares = 0;
+            for (let i = 0; i < combinedFloat32.length; i++) {
+                sumSquares += combinedFloat32[i] * combinedFloat32[i];
+            }
+            const rms = Math.sqrt(sumSquares / combinedFloat32.length);
+            if (rms < 0.003) {
+                console.log("[DSP LOG] 6s frame skipped (silence). RMS: " + rms);
+                return;
+            }
+
+            // C) Normalize ONCE
+            let maxVal = 0;
+            for (let i = 0; i < combinedFloat32.length; i++) {
+                const absVal = Math.abs(combinedFloat32[i]);
+                if (absVal > maxVal) maxVal = absVal;
+            }
+            const multiplier = maxVal > 0 ? 1.0 / maxVal : 1.0;
+            const normalizedData = new Float32Array(combinedFloat32.length);
+            for (let i = 0; i < combinedFloat32.length; i++) {
+                normalizedData[i] = combinedFloat32[i] * multiplier;
+            }
+
+            // D) Downsample ONCE (Averaging)
+            const ratio = inputSampleRate / 16000;
+            const newLength = Math.round(normalizedData.length / ratio);
+            const downsampled = new Float32Array(newLength);
+            for (let i = 0; i < newLength; i++) {
+                const startIndex = Math.floor(i * ratio);
+                const endIndex = Math.floor((i + 1) * ratio);
+                let sum = 0;
+                let count = 0;
+                for (let j = startIndex; j < endIndex && j < normalizedData.length; j++) {
+                    sum += normalizedData[j];
+                    count++;
+                }
+                downsampled[i] = count > 0 ? sum / count : 0;
+            }
+
+            // E) Convert to Int16 PCM safely
+            const pcm16 = new Int16Array(downsampled.length);
+            for (let i = 0; i < downsampled.length; i++) {
+                const s = Math.max(-1, Math.min(1, downsampled[i]));
+                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+
+            // Safe array dispatch
+            const safePayload = Buffer.from(new Uint8Array(pcm16.buffer.slice(0)));
+            console.log(`[MAIN DSP] Piped normalized chunk to Whisper. Original float points: ${combinedFloat32.length}, Sent bytes: ${safePayload.length}, Rate: ${inputSampleRate}`);
 
             if (whisperProcess && !whisperProcess.killed && whisperProcess.stdin) {
                 try {
-                    whisperProcess.stdin.write(combinedBuffer.toString('base64') + '\n');
+                    whisperProcess.stdin.write(safePayload.toString('base64') + '\n');
                 } catch (err) {
                     console.error("[WHISPER GUARD] Failed writing to stdin:", err);
                 }
             }
-        }, 3000);
+        }, 6000);
 
         mainWindow.webContents.send('audio-status', 'started');
     } else {
@@ -187,18 +240,17 @@ ipcMain.on('start-audio', (event) => {
     }
 });
 
-ipcMain.on('audio-chunk', (event, chunk) => {
-    // chunk is passed from renderer as ArrayBuffer -> Buffer wrapped safely
+ipcMain.on('audio-chunk', (event, payload) => {
+    // payload is { data: Buffer, sampleRate: number }
     if (USE_LOCAL_WHISPER) {
-        if (!chunk) return;
-        localWhisperBuffer.push(Buffer.from(chunk));
-        // STEP 6 GUARD: Safe logging to prevent lag
+        if (!payload || !payload.data) return;
+        localWhisperBuffer.push(payload);
         if (localWhisperBuffer.length % 50 === 0) {
             console.log(`[MAIN GUARD] Accumulated ${localWhisperBuffer.length} Whisper audio chunks...`);
         }
     } else {
         if (awsTranscribeService.isActive) {
-            awsTranscribeService.pushAudioChunk(chunk);
+            awsTranscribeService.pushAudioChunk(payload.data);
         }
     }
 });

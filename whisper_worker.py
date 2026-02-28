@@ -9,7 +9,7 @@ warnings.filterwarnings("ignore")
 
 def main():
     try:
-        model = WhisperModel("base", device="cpu", compute_type="int8")
+        model = WhisperModel("small", device="cpu", compute_type="int8")
         print("Model loaded!", file=sys.stderr)
         
         for line in sys.stdin:

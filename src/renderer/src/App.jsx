@@ -181,29 +181,16 @@ function App() {
         processor.onaudioprocess = (e) => {
             const inputData = e.inputBuffer.getChannelData(0);
             if (CRASH_ISOLATION_STEP === 5) {
-                // ONLY log — no conversion, no IPC
                 console.log(`[ISO STEP 5] Frame size: ${inputData.length}, sampleRate: ${audioContext.sampleRate}`);
                 return;
             }
 
-            // STEP 6 — Full safe conversion + IPC send
-            const ratio = audioContext.sampleRate / 16000;
-            const newLength = Math.round(inputData.length / ratio);
-            const downsampled = new Float32Array(newLength);
-            let offset = 0;
-            for (let i = 0; i < newLength; i++) {
-                downsampled[i] = inputData[Math.floor(offset)] || 0;
-                offset += ratio;
-            }
-            const pcm16 = new Int16Array(downsampled.length);
-            for (let i = 0; i < downsampled.length; i++) {
-                const s = Math.max(-1, Math.min(1, downsampled[i]));
-                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            }
             if (ipcRenderer) {
-                // Use Buffer.from() — Electron 28 IPC cannot deserialize Uint8Array/typed arrays (reason 263 crash)
-                const buffer = Buffer.from(pcm16.buffer);
-                ipcRenderer.send('audio-chunk', buffer);
+                // 1) REMOVE PER-FRAME NORMALIZATION: Send raw Float32 array safely
+                // Wrap in Uint8Array over the buffer to avoid detached array crashes
+                const rawPayload = Buffer.from(new Uint8Array(inputData.buffer.slice(0)));
+                // We must send sampleRate so main process can downsample accurately
+                ipcRenderer.send('audio-chunk', { data: rawPayload, sampleRate: audioContext.sampleRate });
             }
         };
 
