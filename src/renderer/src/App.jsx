@@ -132,12 +132,12 @@ function App() {
                     }
                 }
             });
-            // Stop video tracks immediately — we only want audio
-            stream.getVideoTracks().forEach(t => t.stop());
-            const audioTracks = stream.getAudioTracks();
-            const audioOnlyStream = new MediaStream(audioTracks);
-            console.log("[ISO STEP 3+] PASS: Desktop audio stream acquired.", audioTracks);
-            stream = audioOnlyStream;
+
+            if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+            }
+
+            console.log("[ISO STEP 3+] PASS: Desktop stream acquired.", stream.getTracks());
         } catch (err) {
             console.error("[ISO STEP 3+] FAIL: Desktop capture failed:", err);
             setIsMonitoring(false);
