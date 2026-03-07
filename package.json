@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "main": "src/main/main.js",
   "scripts": {
-    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev": "npx kill-port 5173 && concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "build": "vite build"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1004.0",
     "@aws-sdk/client-transcribe-streaming": "^3.1003.0",
     "axios": "^1.6.7",
     "dotenv": "^17.3.1",

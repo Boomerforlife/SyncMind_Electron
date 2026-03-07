@@ -127,15 +127,14 @@ function App() {
         // CRITICAL: On Windows/Electron, audio-only desktop capture crashes Chromium.
         // Must request video:true along with audio to open the desktop capture pipeline,
         // then stop the video track immediately.
-        if (!selectedSource) {
-            console.error("[ISO STEP 3+] No source selected.");
-            setIsMonitoring(false);
-            return;
-        }
-        console.log(`[ISO STEP 3+] selectedSource: ${selectedSource}`);
 
         let stream;
         try {
+            if (!selectedSource) {
+                throw new Error("No desktop source selected to capture");
+            }
+            console.log(`[AUDIO] Attempting Desktop capture for source: ${selectedSource}`);
+
             stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     mandatory: {
@@ -155,11 +154,17 @@ function App() {
                 videoRef.current.srcObject = stream;
             }
 
-            console.log("[ISO STEP 3+] PASS: Desktop stream acquired.", stream.getTracks());
+            console.log("[AUDIO] Capture device initialized (Desktop)");
         } catch (err) {
-            console.error("[ISO STEP 3+] FAIL: Desktop capture failed:", err);
-            setIsMonitoring(false);
-            return;
+            console.warn("[AUDIO] Desktop capture failed, falling back to Microphone:", err);
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                console.log("[AUDIO] Capture device initialized (Microphone)");
+            } catch (fallbackErr) {
+                console.error("[AUDIO] FAIL: Both Desktop and Microphone capture failed:", fallbackErr);
+                setIsMonitoring(false);
+                return;
+            }
         }
 
         if (CRASH_ISOLATION_STEP === 3) {
@@ -221,6 +226,7 @@ function App() {
 
         if (ipcRenderer) {
             ipcRenderer.send("set-auth-token", authToken); // Ensure main process has the latest token
+            console.log("[AUDIO] recording started");
             ipcRenderer.send('start-audio');
         }
     };
@@ -242,6 +248,7 @@ function App() {
         if (audioContextRef.current) audioContextRef.current.close();
 
         if (ipcRenderer) {
+            console.log("[AUDIO] recording stopped");
             ipcRenderer.send('stop-audio');
         }
     };

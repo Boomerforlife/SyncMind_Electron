@@ -2,34 +2,15 @@ require('dotenv').config();
 const { app, BrowserWindow, BrowserView, ipcMain, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const axios = require('axios');
 const { spawn } = require('child_process');
-const TranscriptManager = require('./transcriptManager');
-const AwsTranscribeService = require('./awsTranscribe');
-
-const SummaryEngine = require('./summaryEngine');
-
-const USE_AWS_TRANSCRIBE = process.env.USE_AWS_TRANSCRIBE === 'true';
-let transcriptionMode = USE_AWS_TRANSCRIBE ? "aws" : "whisper";
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 let mainWindow;
-let scraperView;
-let transcriptManager;
-let awsTranscribeService;
-let summaryEngine;
-
-let localWhisperBuffer = [];
-let localWhisperInterval = null;
-let whisperProcess = null;
 
 // Meeting Logger Path
 const logFilePath = path.join(process.cwd(), 'meeting_log.txt');
 
-ipcMain.handle('get-whisper-mode', () => transcriptionMode === "whisper");
-ipcMain.on("toggle-transcription-mode", (event, useAWS) => {
-    console.log("Transcription mode switched:", useAWS ? "AWS" : "Whisper");
-    transcriptionMode = useAWS ? "aws" : "whisper";
-});
+ipcMain.handle('get-whisper-mode', () => false);
 
 let globalAuthToken = "";
 let meetingStartTime = null;
@@ -49,51 +30,6 @@ function createWindow() {
         frame: true,
         transparent: false,
         alwaysOnTop: false,
-    });
-
-    transcriptManager = new TranscriptManager();
-    awsTranscribeService = new AwsTranscribeService(transcriptManager);
-    summaryEngine = new SummaryEngine();
-
-    // Note: We are keeping the old BrowserView code intact just in case, but
-    // the new Architecture relies on the <webview> in the Renderer.
-    // Creating the hidden Scraper BrowserView (Legacy/Hybrid)
-    scraperView = new BrowserView({
-        webPreferences: {
-            nodeIntegration: false,
-            contextIsolation: true,
-            preload: path.join(__dirname, '../preload/scraperPreload.js')
-        }
-    });
-
-    mainWindow.setBrowserView(scraperView);
-    // Hide it out of bounds
-    scraperView.setBounds({ x: 0, y: 0, width: 0, height: 0 });
-
-    // Load a placeholder meeting URL
-    scraperView.webContents.loadURL('https://teams.microsoft.com');
-
-    // Inject our observer once loaded
-    scraperView.webContents.on('did-finish-load', () => {
-        scraperView.webContents.executeJavaScript(`
-            (function() {
-                const observer = new MutationObserver((mutations) => {
-                    mutations.forEach((mutation) => {
-                        mutation.addedNodes.forEach((node) => {
-                            // Example selector for Teams/Zoom
-                            if (node.nodeType === 1 && (node.matches('.ts-message-text') || node.classList.contains('caption-content'))) {
-                                const text = node.innerText || node.textContent;
-                                if (text && window.scraperApi) {
-                                    window.scraperApi.sendCaption(text);
-                                }
-                            }
-                        });
-                    });
-                });
-                observer.observe(document.body, { childList: true, subtree: true });
-                console.log('Hybrid Sensor: Caption Observer Injected');
-            })();
-        `);
     });
 
     // Load Vite dev server if in development, else load local file
@@ -124,248 +60,175 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-    if (transcriptManager) transcriptManager.destroy();
-    if (summaryEngine) summaryEngine.destroy();
     if (process.platform !== 'darwin') {
         app.quit();
     }
 });
 
+let audioBuffer = [];
+let sampleRate = 16000;
+
 // Audio Stream IPC
 ipcMain.on('start-audio', (event) => {
     meetingStartTime = Date.now();
-    if (transcriptionMode === "whisper") {
-        localWhisperBuffer = [];
-        if (localWhisperInterval) clearInterval(localWhisperInterval);
-
-        // STEP 7 GUARD: Spawn Python ONCE cleanly, handle errors
-        if (!whisperProcess || whisperProcess.killed) {
-            try {
-                const pythonExe = path.join(process.cwd(), 'venv', 'Scripts', 'python.exe');
-                console.log("[WHISPER GUARD] Spawning python process...");
-                whisperProcess = spawn(pythonExe, ['whisper_worker.py']);
-
-                whisperProcess.stdout.on('data', (data) => {
-                    const strings = data.toString().split('\n');
-                    for (const str of strings) {
-                        if (!str.trim()) continue;
-                        try {
-                            const result = JSON.parse(str);
-                            if (result.text && result.text.trim()) {
-                                transcriptManager.addAwsText(result.text.trim());
-                            }
-                        } catch (err) {
-                            console.error("[WHISPER GUARD] parsing error:", err, "Raw:", str);
-                        }
-                    }
-                });
-
-                whisperProcess.stderr.on('data', (data) => {
-                    console.error("[WHISPER GUARD ERR]:", data.toString());
-                });
-
-                whisperProcess.on('error', (err) => {
-                    console.error("[WHISPER GUARD FATAL] Failed to spawn:", err);
-                });
-
-                whisperProcess.on('close', (code) => {
-                    console.warn(`[WHISPER GUARD] Process exited with code ${code}`);
-                });
-            } catch (err) {
-                console.error("[WHISPER GUARD FATAL] Exception spawning python:", err);
-            }
-        } else {
-            console.log("[WHISPER GUARD] Reusing existing python process.");
-        }
-
-        localWhisperInterval = setInterval(() => {
-            if (localWhisperBuffer.length === 0) return;
-
-            const chunks = [...localWhisperBuffer];
-            localWhisperBuffer = [];
-
-            // A) Combine Float32 frames
-            const inputSampleRate = chunks[0].sampleRate || 48000;
-            const totalBytes = chunks.reduce((acc, curr) => acc + curr.data.length, 0);
-            const combinedBuffer = Buffer.concat(chunks.map(c => Buffer.from(c.data)), totalBytes);
-            // Reconstruct Float32Array from combined bytes
-            const combinedFloat32 = new Float32Array(combinedBuffer.buffer, combinedBuffer.byteOffset, combinedBuffer.length / 4);
-
-            // B) Compute RMS
-            let sumSquares = 0;
-            for (let i = 0; i < combinedFloat32.length; i++) {
-                sumSquares += combinedFloat32[i] * combinedFloat32[i];
-            }
-            const rms = Math.sqrt(sumSquares / combinedFloat32.length);
-            if (rms < 0.003) {
-                console.log("[DSP LOG] 6s frame skipped (silence). RMS: " + rms);
-                return;
-            }
-
-            // C) Normalize ONCE
-            let maxVal = 0;
-            for (let i = 0; i < combinedFloat32.length; i++) {
-                const absVal = Math.abs(combinedFloat32[i]);
-                if (absVal > maxVal) maxVal = absVal;
-            }
-            const multiplier = maxVal > 0 ? 1.0 / maxVal : 1.0;
-            const normalizedData = new Float32Array(combinedFloat32.length);
-            for (let i = 0; i < combinedFloat32.length; i++) {
-                normalizedData[i] = combinedFloat32[i] * multiplier;
-            }
-
-            // D) Downsample ONCE (Averaging)
-            const ratio = inputSampleRate / 16000;
-            const newLength = Math.round(normalizedData.length / ratio);
-            const downsampled = new Float32Array(newLength);
-            for (let i = 0; i < newLength; i++) {
-                const startIndex = Math.floor(i * ratio);
-                const endIndex = Math.floor((i + 1) * ratio);
-                let sum = 0;
-                let count = 0;
-                for (let j = startIndex; j < endIndex && j < normalizedData.length; j++) {
-                    sum += normalizedData[j];
-                    count++;
-                }
-                downsampled[i] = count > 0 ? sum / count : 0;
-            }
-
-            // E) Convert to Int16 PCM safely
-            const pcm16 = new Int16Array(downsampled.length);
-            for (let i = 0; i < downsampled.length; i++) {
-                const s = Math.max(-1, Math.min(1, downsampled[i]));
-                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            }
-
-            // Safe array dispatch
-            const safePayload = Buffer.from(new Uint8Array(pcm16.buffer.slice(0)));
-            console.log(`[MAIN DSP] Piped normalized chunk to Whisper. Original float points: ${combinedFloat32.length}, Sent bytes: ${safePayload.length}, Rate: ${inputSampleRate}`);
-
-            if (whisperProcess && !whisperProcess.killed && whisperProcess.stdin) {
-                try {
-                    whisperProcess.stdin.write(safePayload.toString('base64') + '\n');
-                } catch (err) {
-                    console.error("[WHISPER GUARD] Failed writing to stdin:", err);
-                }
-            }
-        }, 6000);
-
-        mainWindow.webContents.send('audio-status', 'started');
-    } else {
-        awsTranscribeService.startStream((status) => {
-            mainWindow.webContents.send('audio-status', status);
-        });
-    }
+    audioBuffer = [];
+    console.log("[AUDIO] recording started");
+    mainWindow.webContents.send('audio-status', 'started');
 });
-
-// Helper function to prepare Float32 audio for AWS Transcribe (16kHz Int16 PCM)
-function processAudioChunk(rawFloat32Buffer, inputSampleRate) {
-    const rawFloat32 = new Float32Array(rawFloat32Buffer.buffer, rawFloat32Buffer.byteOffset, rawFloat32Buffer.length / 4);
-
-    // 0) Calculate RMS & Apply Silence Gate
-    let sumSquares = 0;
-    for (let i = 0; i < rawFloat32.length; i++) {
-        sumSquares += rawFloat32[i] * rawFloat32[i];
-    }
-    const rms = Math.sqrt(sumSquares / rawFloat32.length);
-    if (rms < 0.002) {
-        console.log(`[AWS DSP] Chunk skipped (silence). RMS: ${rms.toFixed(5)}`);
-        return null;
-    }
-
-    // 1) Normalize
-    let maxVal = 0;
-    for (let i = 0; i < rawFloat32.length; i++) {
-        if (Math.abs(rawFloat32[i]) > maxVal) maxVal = Math.abs(rawFloat32[i]);
-    }
-    const multiplier = maxVal > 0 ? 1.0 / maxVal : 1.0;
-    const normalizedData = new Float32Array(rawFloat32.length);
-    for (let i = 0; i < rawFloat32.length; i++) {
-        normalizedData[i] = rawFloat32[i] * multiplier;
-    }
-
-    // 2) Downsample to 16kHz
-    const ratio = inputSampleRate / 16000;
-    const newLength = Math.round(normalizedData.length / ratio);
-    const downsampled = new Float32Array(newLength);
-    for (let i = 0; i < newLength; i++) {
-        const startIndex = Math.floor(i * ratio);
-        const endIndex = Math.floor((i + 1) * ratio);
-        let sum = 0, count = 0;
-        for (let j = startIndex; j < endIndex && j < normalizedData.length; j++) {
-            sum += normalizedData[j];
-            count++;
-        }
-        downsampled[i] = count > 0 ? sum / count : 0;
-    }
-
-    // 3) Convert to Int16 PCM
-    const pcm16 = new Int16Array(downsampled.length);
-    for (let i = 0; i < downsampled.length; i++) {
-        const s = Math.max(-1, Math.min(1, downsampled[i]));
-        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-
-    return Buffer.from(new Uint8Array(pcm16.buffer.slice(0)));
-}
 
 ipcMain.on('audio-chunk', (event, payload) => {
     // payload is { data: Buffer, sampleRate: number }
     if (!payload || !payload.data) return;
 
-    if (transcriptionMode === "whisper") {
-        localWhisperBuffer.push(payload);
-        if (localWhisperBuffer.length % 50 === 0) {
-            console.log(`[MAIN GUARD] Accumulated ${localWhisperBuffer.length} Whisper audio chunks...`);
-        }
-    } else {
-        if (awsTranscribeService.isActive) {
-            const pcmBuffer = processAudioChunk(payload.data, payload.sampleRate);
-            if (pcmBuffer) {
-                awsTranscribeService.pushAudioChunk(pcmBuffer);
+    sampleRate = payload.sampleRate || 16000;
+
+    // We expect raw float32 PCM data from the renderer
+    audioBuffer.push(payload.data);
+});
+
+async function uploadToS3(filePath, fileName) {
+    const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
+    const bucketName = "syncmind-meeting-audio";
+
+    try {
+        const fileStream = fs.createReadStream(filePath);
+        const uploadParams = {
+            Bucket: bucketName,
+            Key: fileName,
+            Body: fileStream,
+            ContentType: 'audio/wav'
+        };
+
+        console.log(`[S3 UPLOAD] started: Uploading ${fileName} to ${bucketName}...`);
+        await s3Client.send(new PutObjectCommand(uploadParams));
+        console.log("[S3 UPLOAD] completed");
+        return true;
+    } catch (err) {
+        console.error("[S3 UPLOAD ERROR] Failed to upload audio:", err);
+        return false;
+    }
+}
+
+function writeWavHeader(buffer, sampleRate, numChannels, byteRate) {
+    const header = Buffer.alloc(44);
+    // RIFF identifier
+    header.write('RIFF', 0);
+    // file length minus RIFF identifier length and file description length
+    header.writeUInt32LE(36 + buffer.length, 4);
+    // RIFF type
+    header.write('WAVE', 8);
+    // format chunk identifier
+    header.write('fmt ', 12);
+    // format chunk length
+    header.writeUInt32LE(16, 16);
+    // sample format (raw)
+    header.writeUInt16LE(1, 20);
+    // channel count
+    header.writeUInt16LE(numChannels, 22);
+    // sample rate
+    header.writeUInt32LE(sampleRate, 24);
+    // byte rate (sample rate * block align)
+    header.writeUInt32LE(byteRate, 28);
+    // block align (channel count * bytes per sample)
+    header.writeUInt16LE(numChannels * 2, 32);
+    // bits per sample
+    header.writeUInt16LE(16, 34);
+    // data chunk identifier
+    header.write('data', 36);
+    // data chunk length
+    header.writeUInt32LE(buffer.length, 40);
+
+    return Buffer.concat([header, buffer]);
+}
+
+let isProcessingAudio = false;
+
+ipcMain.on('stop-audio', async (event) => {
+    if (isProcessingAudio) return;
+    isProcessingAudio = true;
+
+    console.log("[AUDIO] recording stopped");
+    mainWindow.webContents.send('audio-status', 'stopped');
+
+    if (audioBuffer.length === 0) {
+        console.log("[AUDIO] No audio data to save.");
+        return;
+    }
+
+    // The renderer sends Float32 buffers. We need to convert back to Int16 PCM.
+    console.log(`[AUDIO] Processing ${audioBuffer.length} chunks...`);
+
+    const combinedBuffer = Buffer.concat(audioBuffer);
+    const float32Array = new Float32Array(combinedBuffer.buffer, combinedBuffer.byteOffset, combinedBuffer.length / 4);
+
+    // Downsample to 16kHz if needed, but for simplicity let's stick to renderer's sample rate
+    // and just convert to Int16
+    const pcm16 = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32Array[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+
+    const pcmBuffer = Buffer.from(new Uint8Array(pcm16.buffer.slice(0)));
+    const numChannels = 1;
+    const byteRate = sampleRate * numChannels * 2;
+
+    const wavBuffer = writeWavHeader(pcmBuffer, sampleRate, numChannels, byteRate);
+
+    const timestamp = Date.now();
+    const fileName = `meeting-${timestamp}.wav`;
+    const filePath = path.join(process.cwd(), fileName);
+
+    fs.writeFileSync(filePath, wavBuffer);
+    console.log(`[AUDIO] audio recording complete: Saved to ${filePath}`);
+
+    audioBuffer = [];
+
+    const uploaded = await uploadToS3(filePath, fileName);
+
+    if (uploaded) {
+        // Trigger Next.js API
+        const apiEndpoint = process.env.NEXTJS_API_ENDPOINT || 'http://localhost:3001/api/process-meeting';
+        console.log(`[API] Triggering backend API: ${apiEndpoint} for ${fileName}`);
+
+        let attempts = 0;
+        let success = false;
+
+        while (attempts < 3 && !success) {
+            try {
+                // We use standard fetch available in Node.js 18+ (Electron 29 supports global fetch)
+                const response = await global.fetch(apiEndpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${globalAuthToken}`
+                    },
+                    body: JSON.stringify({ audioFileName: fileName })
+                });
+
+                if (!response.ok) {
+                    console.error(`[API ERROR] Backend responded with status: ${response.status}`);
+                    break; // If it responded but with an error status (e.g. 500), no point retrying connection
+                } else {
+                    console.log("[API] backend triggered");
+                    success = true;
+                }
+            } catch (err) {
+                attempts++;
+                console.error(`[API ERROR] Backend unavailable. Retrying in 2 seconds... (Attempt ${attempts}/3)`);
+                await new Promise(r => setTimeout(r, 2000));
             }
         }
-    }
-});
 
-ipcMain.on('stop-audio', (event) => {
-    const durationSeconds = meetingStartTime ? Math.floor((Date.now() - meetingStartTime) / 1000) : 0;
-    const meetingTitle = `Meeting - ${new Date().toLocaleDateString()}`;
-
-    if (transcriptionMode === "whisper") {
-        if (localWhisperInterval) clearInterval(localWhisperInterval);
-        localWhisperBuffer = [];
-        if (whisperProcess && !whisperProcess.killed) {
-            whisperProcess.kill();
+        if (!success) {
+            console.error("[API ERROR] Failed to trigger backend after retries.");
         }
-        whisperProcess = null;
-        mainWindow.webContents.send('audio-status', 'stopped');
-    } else {
-        awsTranscribeService.stopStream((status) => {
-            mainWindow.webContents.send('audio-status', status);
-        });
     }
 
-    // Trigger Final Upload
-    if (transcriptManager) {
-        transcriptManager.uploadFinalTranscript(globalAuthToken, durationSeconds, meetingTitle);
-    }
-    meetingStartTime = null;
+    isProcessingAudio = false;
 });
 
-// Scraper IPC from hidden view
-ipcMain.on('scraper-caption-detected', (event, text) => {
-    if (transcriptManager) {
-        transcriptManager.addScraperText(text);
-        mainWindow.webContents.send('caption-status', 'detected');
 
-        // Reset to idle after 3 seconds of no captions
-        if (global.captionTimeout) clearTimeout(global.captionTimeout);
-        global.captionTimeout = setTimeout(() => {
-            mainWindow.webContents.send('caption-status', 'idle');
-        }, 3000);
-    }
-});
 
 // ipcMain.on('ocr-caption-detected', (event, text) => {
 //     console.log("MAIN PROCESS RECEIVED OCR:", text);
