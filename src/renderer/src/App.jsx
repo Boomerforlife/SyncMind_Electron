@@ -22,7 +22,8 @@ function App() {
     const [isMonitoring, setIsMonitoring] = useState(false);
     const [liveTranscript, setLiveTranscript] = useState('');
     const [isFloating, setIsFloating] = useState(false);
-    const [whisperMode, setWhisperMode] = useState(false);
+    const [useAWS, setUseAWS] = useState(false);
+    const [authToken, setAuthToken] = useState(() => localStorage.getItem('syncmind_auth_token') || '');
 
     const videoRef = useRef(null);
     const streamRef = useRef(null);
@@ -37,7 +38,7 @@ function App() {
         fetchSources();
 
         if (ipcRenderer) {
-            ipcRenderer.invoke('get-whisper-mode').then(mode => setWhisperMode(mode));
+            ipcRenderer.invoke('get-whisper-mode').then(mode => setUseAWS(!mode));
             ipcRenderer.on('transcript-updated', (event, text) => {
                 setLiveTranscript(text);
             });
@@ -75,6 +76,23 @@ function App() {
         if (ipcRenderer) {
             const mode = await ipcRenderer.invoke('toggle-floating-mode');
             setIsFloating(mode);
+        }
+    };
+
+    const toggleEngine = async () => {
+        if (ipcRenderer && !isMonitoring) {
+            const nextMode = !useAWS;
+            setUseAWS(nextMode);
+            ipcRenderer.send("toggle-transcription-mode", nextMode);
+        }
+    };
+
+    const handleAuthTokenChange = (e) => {
+        const val = e.target.value;
+        setAuthToken(val);
+        localStorage.setItem('syncmind_auth_token', val);
+        if (ipcRenderer) {
+            ipcRenderer.send("set-auth-token", val);
         }
     };
 
@@ -202,6 +220,7 @@ function App() {
         gainNode.connect(audioContext.destination);
 
         if (ipcRenderer) {
+            ipcRenderer.send("set-auth-token", authToken); // Ensure main process has the latest token
             ipcRenderer.send('start-audio');
         }
     };
@@ -237,10 +256,29 @@ function App() {
             {/* Header controls */}
             <div className="flex justify-between items-center drag-region">
                 <h1 className="font-bold text-lg text-text px-2">Silent Teammate <span className="text-primary text-xs uppercase ml-2">Recorder Mode</span></h1>
-                <button className="text-xs bg-white/10 hover:bg-white/20 px-3 py-1 rounded no-drag-region" onClick={toggleFloatingMode}>Toggle Popout</button>
+                <div className="no-drag-region flex gap-2">
+                    <button
+                        className={`text-xs px-3 py-1 rounded no-drag-region transition-colors ${isMonitoring ? 'opacity-50 cursor-not-allowed' : 'hover:bg-white/10'} ${useAWS ? 'bg-blue-600/30 text-blue-400 border border-blue-500/50' : 'bg-green-600/30 text-green-400 border border-green-500/50'}`}
+                        onClick={toggleEngine}
+                        disabled={isMonitoring}
+                        title="Switch Transcription Engine"
+                    >
+                        {useAWS ? 'Use Whisper' : 'Use AWS'}
+                    </button>
+                    <button className="text-xs bg-white/10 hover:bg-white/20 px-3 py-1 rounded" onClick={toggleFloatingMode}>Toggle Popout</button>
+                </div>
             </div>
 
             <div className="flex gap-2">
+                <input
+                    type="text"
+                    placeholder="Paste Auth Token here"
+                    value={authToken}
+                    onChange={handleAuthTokenChange}
+                    disabled={isMonitoring}
+                    className="flex-1 max-w-[200px] bg-surface border border-white/20 hover:border-white/40 rounded px-2 py-1 text-sm text-text outline-none focus:border-primary"
+                />
+
                 <select
                     className="flex-1 bg-surface border border-white/10 rounded px-2 py-1 text-sm text-text"
                     value={selectedSource}
@@ -267,8 +305,8 @@ function App() {
                 <div className="flex-1 bg-surface border border-white/10 rounded flex flex-col p-4 overflow-hidden shadow-lg">
                     <div className="flex justify-between items-center mb-3">
                         <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">Meeting Transcript</h2>
-                        <span className={`text-[10px] px-2 py-1 rounded text-white font-medium ${whisperMode ? 'bg-green-600' : 'bg-blue-600'}`}>
-                            {whisperMode ? 'Local Whisper Mode' : 'AWS Transcribe Mode'}
+                        <span className={`text-[10px] px-2 py-1 rounded text-white font-medium ${useAWS ? 'bg-green-600' : 'bg-blue-600'}`}>
+                            {useAWS ? 'AWS Transcribe Mode' : 'Local Whisper Mode'}
                         </span>
                     </div>
                     <div className="flex-1 overflow-y-auto text-base text-text/90 p-4 bg-black/30 rounded flex flex-col gap-2 relative">

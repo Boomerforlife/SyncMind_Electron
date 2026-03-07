@@ -7,12 +7,16 @@ const { spawn } = require('child_process');
 const TranscriptManager = require('./transcriptManager');
 const AwsTranscribeService = require('./awsTranscribe');
 
-const USE_LOCAL_WHISPER = true;
+const SummaryEngine = require('./summaryEngine');
+
+const USE_AWS_TRANSCRIBE = process.env.USE_AWS_TRANSCRIBE === 'true';
+let transcriptionMode = USE_AWS_TRANSCRIBE ? "aws" : "whisper";
 
 let mainWindow;
 let scraperView;
 let transcriptManager;
 let awsTranscribeService;
+let summaryEngine;
 
 let localWhisperBuffer = [];
 let localWhisperInterval = null;
@@ -21,7 +25,18 @@ let whisperProcess = null;
 // Meeting Logger Path
 const logFilePath = path.join(process.cwd(), 'meeting_log.txt');
 
-ipcMain.handle('get-whisper-mode', () => USE_LOCAL_WHISPER);
+ipcMain.handle('get-whisper-mode', () => transcriptionMode === "whisper");
+ipcMain.on("toggle-transcription-mode", (event, useAWS) => {
+    console.log("Transcription mode switched:", useAWS ? "AWS" : "Whisper");
+    transcriptionMode = useAWS ? "aws" : "whisper";
+});
+
+let globalAuthToken = "";
+let meetingStartTime = null;
+
+ipcMain.on("set-auth-token", (e, token) => {
+    globalAuthToken = token;
+});
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -38,6 +53,7 @@ function createWindow() {
 
     transcriptManager = new TranscriptManager();
     awsTranscribeService = new AwsTranscribeService(transcriptManager);
+    summaryEngine = new SummaryEngine();
 
     // Note: We are keeping the old BrowserView code intact just in case, but
     // the new Architecture relies on the <webview> in the Renderer.
@@ -109,6 +125,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
     if (transcriptManager) transcriptManager.destroy();
+    if (summaryEngine) summaryEngine.destroy();
     if (process.platform !== 'darwin') {
         app.quit();
     }
@@ -116,7 +133,8 @@ app.on('window-all-closed', () => {
 
 // Audio Stream IPC
 ipcMain.on('start-audio', (event) => {
-    if (USE_LOCAL_WHISPER) {
+    meetingStartTime = Date.now();
+    if (transcriptionMode === "whisper") {
         localWhisperBuffer = [];
         if (localWhisperInterval) clearInterval(localWhisperInterval);
 
@@ -240,23 +258,81 @@ ipcMain.on('start-audio', (event) => {
     }
 });
 
+// Helper function to prepare Float32 audio for AWS Transcribe (16kHz Int16 PCM)
+function processAudioChunk(rawFloat32Buffer, inputSampleRate) {
+    const rawFloat32 = new Float32Array(rawFloat32Buffer.buffer, rawFloat32Buffer.byteOffset, rawFloat32Buffer.length / 4);
+
+    // 0) Calculate RMS & Apply Silence Gate
+    let sumSquares = 0;
+    for (let i = 0; i < rawFloat32.length; i++) {
+        sumSquares += rawFloat32[i] * rawFloat32[i];
+    }
+    const rms = Math.sqrt(sumSquares / rawFloat32.length);
+    if (rms < 0.002) {
+        console.log(`[AWS DSP] Chunk skipped (silence). RMS: ${rms.toFixed(5)}`);
+        return null;
+    }
+
+    // 1) Normalize
+    let maxVal = 0;
+    for (let i = 0; i < rawFloat32.length; i++) {
+        if (Math.abs(rawFloat32[i]) > maxVal) maxVal = Math.abs(rawFloat32[i]);
+    }
+    const multiplier = maxVal > 0 ? 1.0 / maxVal : 1.0;
+    const normalizedData = new Float32Array(rawFloat32.length);
+    for (let i = 0; i < rawFloat32.length; i++) {
+        normalizedData[i] = rawFloat32[i] * multiplier;
+    }
+
+    // 2) Downsample to 16kHz
+    const ratio = inputSampleRate / 16000;
+    const newLength = Math.round(normalizedData.length / ratio);
+    const downsampled = new Float32Array(newLength);
+    for (let i = 0; i < newLength; i++) {
+        const startIndex = Math.floor(i * ratio);
+        const endIndex = Math.floor((i + 1) * ratio);
+        let sum = 0, count = 0;
+        for (let j = startIndex; j < endIndex && j < normalizedData.length; j++) {
+            sum += normalizedData[j];
+            count++;
+        }
+        downsampled[i] = count > 0 ? sum / count : 0;
+    }
+
+    // 3) Convert to Int16 PCM
+    const pcm16 = new Int16Array(downsampled.length);
+    for (let i = 0; i < downsampled.length; i++) {
+        const s = Math.max(-1, Math.min(1, downsampled[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+
+    return Buffer.from(new Uint8Array(pcm16.buffer.slice(0)));
+}
+
 ipcMain.on('audio-chunk', (event, payload) => {
     // payload is { data: Buffer, sampleRate: number }
-    if (USE_LOCAL_WHISPER) {
-        if (!payload || !payload.data) return;
+    if (!payload || !payload.data) return;
+
+    if (transcriptionMode === "whisper") {
         localWhisperBuffer.push(payload);
         if (localWhisperBuffer.length % 50 === 0) {
             console.log(`[MAIN GUARD] Accumulated ${localWhisperBuffer.length} Whisper audio chunks...`);
         }
     } else {
         if (awsTranscribeService.isActive) {
-            awsTranscribeService.pushAudioChunk(payload.data);
+            const pcmBuffer = processAudioChunk(payload.data, payload.sampleRate);
+            if (pcmBuffer) {
+                awsTranscribeService.pushAudioChunk(pcmBuffer);
+            }
         }
     }
 });
 
 ipcMain.on('stop-audio', (event) => {
-    if (USE_LOCAL_WHISPER) {
+    const durationSeconds = meetingStartTime ? Math.floor((Date.now() - meetingStartTime) / 1000) : 0;
+    const meetingTitle = `Meeting - ${new Date().toLocaleDateString()}`;
+
+    if (transcriptionMode === "whisper") {
         if (localWhisperInterval) clearInterval(localWhisperInterval);
         localWhisperBuffer = [];
         if (whisperProcess && !whisperProcess.killed) {
@@ -269,6 +345,12 @@ ipcMain.on('stop-audio', (event) => {
             mainWindow.webContents.send('audio-status', status);
         });
     }
+
+    // Trigger Final Upload
+    if (transcriptManager) {
+        transcriptManager.uploadFinalTranscript(globalAuthToken, durationSeconds, meetingTitle);
+    }
+    meetingStartTime = null;
 });
 
 // Scraper IPC from hidden view

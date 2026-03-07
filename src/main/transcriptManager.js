@@ -9,11 +9,6 @@ class TranscriptManager {
         this.lastOcrText = "";
         this.lastOcrEmitTime = 0;
         this.lastOcrEmitText = "";
-
-        // Every 20 seconds, process the transcript and POST to AWS Lambda
-        this.postInterval = setInterval(() => {
-            this.postAccumulatedTranscript();
-        }, 20000);
     }
 
     addAwsText(text) {
@@ -121,27 +116,40 @@ class TranscriptManager {
         return union === 0 ? 100 : (intersection / union) * 100;
     }
 
-    async postAccumulatedTranscript() {
-        if (!this.accumulatedTranscript.trim()) return;
+    async uploadFinalTranscript(token, durationSeconds, meetingTitle) {
+        if (!this.accumulatedTranscript.trim() || !token) {
+            console.log("Skipping upload: No transcript or missing token.");
+            return;
+        }
 
         const payload = {
-            transcript: this.accumulatedTranscript.trim()
+            transcript: this.accumulatedTranscript.trim(),
+            duration: durationSeconds,
+            meetingTitle
         };
 
         try {
-            // Placeholder Lambda endpoint
-            const endpoint = process.env.LAMBDA_ENDPOINT || 'https://placeholder.execute-api.us-east-1.amazonaws.com/dev/accumulate';
-            // await axios.post(endpoint, payload);
-            console.log('Successfully posted Accumulated Transcript to Lambda (Mock):', payload.transcript);
+            console.log('Valid transcript ready. Uploading to SyncMind Dashboard API...');
+            const endpoint = process.env.NEXTJS_API_ENDPOINT || 'http://localhost:3001/api/meetings';
+
+            await axios.post(endpoint, payload, {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            });
+            console.log('Successfully posted Meeting Transcript to Dashboard API.');
+            // Clear transcript for next meeting
+            this.accumulatedTranscript = "";
+            this.scraperQueue = [];
+            this.awsQueue = [];
         } catch (error) {
             console.error('Failed to post accumulated transcript:', error.message);
-            // Depending on robustness requirements, we might want to put the text back
-            // this.accumulatedTranscript = payload.transcript + " " + this.accumulatedTranscript;
         }
     }
 
     destroy() {
-        clearInterval(this.postInterval);
+        // Cleanup if needed
+
     }
 }
 
