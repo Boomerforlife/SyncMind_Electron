@@ -1,16 +1,15 @@
-const { app, BrowserWindow, BrowserView, ipcMain, desktopCapturer } = require('electron');
-const path = require('path');
-const fs = require('fs');
-const dotenv = require('dotenv');
+const path = require("path");
+const dotenv = require("dotenv");
+const { app, BrowserWindow, BrowserView, ipcMain, desktopCapturer } = require("electron");
 
-// Load environment variables based on environment
 const envPath = app.isPackaged
-    ? path.join(process.resourcesPath, '.env')
-    : path.resolve(app.getAppPath(), '.env');
+    ? path.join(process.resourcesPath, ".env")
+    : path.join(__dirname, "../../.env");
 
 dotenv.config({ path: envPath });
 
-const { spawn } = require('child_process');
+const fs = require("fs");
+const { spawn } = require("child_process");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 let mainWindow;

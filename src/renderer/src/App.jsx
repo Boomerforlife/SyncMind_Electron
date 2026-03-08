@@ -1,10 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-// import Tesseract from 'tesseract.js';
 
-// With nodeIntegration: true and contextIsolation: false, we can require electron directly in the renderer
-const electron = window.require ? window.require('electron') : null;
-const ipcRenderer = electron ? electron.ipcRenderer : null;
-const desktopCapturer = electron ? electron.desktopCapturer : null;
+// Secure preload bridge — no more window.require('electron')
+const api = window.api || null;
 
 // Crash Diagnostic Addition
 window.onerror = function (message, source, lineno, colno, error) {
@@ -37,18 +34,15 @@ function App() {
     useEffect(() => {
         fetchSources();
 
-        if (ipcRenderer) {
-            ipcRenderer.invoke('get-whisper-mode').then(mode => setUseAWS(!mode));
-            ipcRenderer.on('transcript-updated', (event, text) => {
+        if (api) {
+            api.getWhisperMode().then(mode => setUseAWS(!mode));
+            api.onTranscriptUpdated((text) => {
                 setLiveTranscript(text);
             });
         }
 
         return () => {
             stopMonitoring();
-            if (ipcRenderer) {
-                ipcRenderer.removeAllListeners('transcript-updated');
-            }
         };
     }, []);
 
@@ -59,31 +53,31 @@ function App() {
     }, [liveTranscript]);
 
     const fetchSources = async () => {
-        if (ipcRenderer) {
+        if (api) {
             try {
-                const desktopSources = await ipcRenderer.invoke('get-desktop-sources');
+                const desktopSources = await api.getDesktopSources();
                 setSources(desktopSources);
                 if (desktopSources.length > 0) setSelectedSource(desktopSources[0].id);
             } catch (err) {
                 console.error("Failed to fetch sources via IPC:", err);
             }
         } else {
-            console.error("ipcRenderer is not available. Ensure nodeIntegration is true.");
+            console.error("api bridge is not available. Check preload.js configuration.");
         }
     };
 
     const toggleFloatingMode = async () => {
-        if (ipcRenderer) {
-            const mode = await ipcRenderer.invoke('toggle-floating-mode');
+        if (api) {
+            const mode = await api.toggleFloatingMode();
             setIsFloating(mode);
         }
     };
 
     const toggleEngine = async () => {
-        if (ipcRenderer && !isMonitoring) {
+        if (api && !isMonitoring) {
             const nextMode = !useAWS;
             setUseAWS(nextMode);
-            ipcRenderer.send("toggle-transcription-mode", nextMode);
+            api.toggleTranscriptionMode(nextMode);
         }
     };
 
@@ -91,42 +85,16 @@ function App() {
         const val = e.target.value;
         setAuthToken(val);
         localStorage.setItem('syncmind_auth_token', val);
-        if (ipcRenderer) {
-            ipcRenderer.send("set-auth-token", val);
+        if (api) {
+            api.setAuthToken(val);
         }
     };
 
-    // CRASH ISOLATION: Set to 1, then increment after each passing test
-    // 1 = button only, 2 = mic capture, 3 = desktop capture, 4 = AudioContext, 5 = ScriptProcessor (log only), 6 = full IPC pipeline
-    const CRASH_ISOLATION_STEP = 6;
-
     const startMonitoring = async () => {
-        console.log(`[ISO STEP ${CRASH_ISOLATION_STEP}] Start Capture clicked`);
+        console.log('[CAPTURE] Start Capture clicked');
 
-        // STEP 1 — Button+State only. If app crashes here the issue is in React state.
         setIsMonitoring(true);
         setLiveTranscript("");
-        if (CRASH_ISOLATION_STEP === 1) {
-            console.log("[ISO STEP 1] PASS: state updated, no crash.");
-            return;
-        }
-
-        // STEP 2 — Mic-only capture (no desktop). If mic crashes, it's a media API issue.
-        if (CRASH_ISOLATION_STEP === 2) {
-            try {
-                const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-                console.log("[ISO STEP 2] PASS: Mic stream acquired.", micStream.getAudioTracks());
-                micStream.getTracks().forEach(t => t.stop());
-            } catch (err) {
-                console.error("[ISO STEP 2] FAIL: Mic capture failed:", err);
-            }
-            return;
-        }
-
-        // STEP 3 — Desktop audio capture.
-        // CRITICAL: On Windows/Electron, audio-only desktop capture crashes Chromium.
-        // Must request video:true along with audio to open the desktop capture pipeline,
-        // then stop the video track immediately.
 
         let stream;
         try {
@@ -167,35 +135,22 @@ function App() {
             }
         }
 
-        if (CRASH_ISOLATION_STEP === 3) {
-            stream.getTracks().forEach(t => t.stop());
-            console.log("[ISO STEP 3] PASS: stream stopped cleanly.");
-            return;
-        }
-
         streamRef.current = stream;
 
-        // STEP 4 — AudioContext only. If this crashes, it's a hardware/driver fault.
+        // AudioContext setup
         let audioContext;
         try {
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            console.log(`[ISO STEP 4+] PASS: AudioContext sampleRate: ${audioContext.sampleRate}`);
+            console.log(`[AUDIO] AudioContext sampleRate: ${audioContext.sampleRate}`);
             audioContextRef.current = audioContext;
         } catch (err) {
-            console.error("[ISO STEP 4+] FAIL: AudioContext creation failed:", err);
+            console.error("[AUDIO] AudioContext creation failed:", err);
             stream.getTracks().forEach(t => t.stop());
             setIsMonitoring(false);
             return;
         }
 
-        if (CRASH_ISOLATION_STEP === 4) {
-            audioContext.close();
-            stream.getTracks().forEach(t => t.stop());
-            console.log("[ISO STEP 4] PASS: AudioContext closed cleanly.");
-            return;
-        }
-
-        // STEP 5 — ScriptProcessor with log only (NO IPC). If this crashes, onaudioprocess is the issue.
+        // ScriptProcessor pipeline
         const source = audioContext.createMediaStreamSource(stream);
         sourceNodeRef.current = source;
         const processor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -203,17 +158,12 @@ function App() {
 
         processor.onaudioprocess = (e) => {
             const inputData = e.inputBuffer.getChannelData(0);
-            if (CRASH_ISOLATION_STEP === 5) {
-                console.log(`[ISO STEP 5] Frame size: ${inputData.length}, sampleRate: ${audioContext.sampleRate}`);
-                return;
-            }
 
-            if (ipcRenderer) {
-                // 1) REMOVE PER-FRAME NORMALIZATION: Send raw Float32 array safely
-                // Wrap in Uint8Array over the buffer to avoid detached array crashes
-                const rawPayload = Buffer.from(new Uint8Array(inputData.buffer.slice(0)));
-                // We must send sampleRate so main process can downsample accurately
-                ipcRenderer.send('audio-chunk', { data: rawPayload, sampleRate: audioContext.sampleRate });
+            if (api) {
+                // Send raw Float32 audio data via structured clone (no Buffer needed)
+                const float32Copy = new Float32Array(inputData.length);
+                float32Copy.set(inputData);
+                api.sendAudioChunk({ data: Array.from(float32Copy), sampleRate: audioContext.sampleRate });
             }
         };
 
@@ -224,10 +174,10 @@ function App() {
         processor.connect(gainNode);
         gainNode.connect(audioContext.destination);
 
-        if (ipcRenderer) {
-            ipcRenderer.send("set-auth-token", authToken); // Ensure main process has the latest token
+        if (api) {
+            api.setAuthToken(authToken); // Ensure main process has the latest token
             console.log("[AUDIO] recording started");
-            ipcRenderer.send('start-audio');
+            api.startAudio();
         }
     };
 
@@ -247,15 +197,11 @@ function App() {
         if (sourceNodeRef.current) sourceNodeRef.current.disconnect();
         if (audioContextRef.current) audioContextRef.current.close();
 
-        if (ipcRenderer) {
+        if (api) {
             console.log("[AUDIO] recording stopped");
-            ipcRenderer.send('stop-audio');
+            api.stopAudio();
         }
     };
-
-    // OCR disabled
-    // const startOcrPipeline = () => {};
-    // const processVideoFrame = async () => {};
 
     return (
         <div className={`p-4 h-screen flex flex-col gap-4 ${isFloating ? 'bg-black/90 backdrop-blur border border-white/20' : 'bg-background'}`}>
